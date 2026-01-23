@@ -77,6 +77,12 @@ const OperationSetting = () => {
     'checkin_setting.enabled': false,
     'checkin_setting.min_quota': 1000,
     'checkin_setting.max_quota': 10000,
+    'checkin_setting.dynamic_reward_enabled': false,
+    'checkin_setting.reward_tiers': '',
+    'checkin_setting.crit_probability': 0.01,
+    'checkin_setting.crit_multiplier': 5,
+    'checkin_setting.crit_guarantee_days': 30,
+    'checkin_setting.streak_bonuses': '',
   });
 
   let [loading, setLoading] = useState(false);
@@ -87,8 +93,12 @@ const OperationSetting = () => {
     if (success) {
       let newInputs = {};
       data.forEach((item) => {
-        if (typeof inputs[item.key] === 'boolean') {
+        const templateValue = inputs[item.key];
+        if (typeof templateValue === 'boolean') {
           newInputs[item.key] = toBoolean(item.value);
+        } else if (typeof templateValue === 'number') {
+          const parsed = Number(item.value);
+          newInputs[item.key] = Number.isFinite(parsed) ? parsed : templateValue;
         } else {
           newInputs[item.key] = item.value;
         }

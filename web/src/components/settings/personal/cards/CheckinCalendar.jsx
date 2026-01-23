@@ -28,6 +28,7 @@ import {
   Tooltip,
   Collapsible,
   Modal,
+  Progress,
 } from '@douyinfe/semi-ui';
 import {
   CalendarCheck,
@@ -35,6 +36,8 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Zap,
+  Flame,
 } from 'lucide-react';
 import Turnstile from 'react-turnstile';
 import { API, showError, showSuccess, renderQuota } from '../../../../helpers';
@@ -46,6 +49,13 @@ const CheckinCalendar = ({ t, status, turnstileEnabled, turnstileSiteKey }) => {
   const [turnstileWidgetKey, setTurnstileWidgetKey] = useState(0);
   const [checkinData, setCheckinData] = useState({
     enabled: false,
+    dynamic_reward_enabled: false,
+    current_streak: 0,
+    crit_probability: 0.01,
+    crit_multiplier: 5,
+    crit_guarantee_days: 30,
+    streak_bonuses: [],
+    reward_tiers: [],
     stats: {
       checked_in_today: false,
       total_checkins: 0,
@@ -57,22 +67,18 @@ const CheckinCalendar = ({ t, status, turnstileEnabled, turnstileSiteKey }) => {
   const [currentMonth, setCurrentMonth] = useState(
     new Date().toISOString().slice(0, 7),
   );
-  // 初始加载状态，用于避免折叠状态闪烁
   const [initialLoaded, setInitialLoaded] = useState(false);
-  // 折叠状态：null 表示未确定（等待首次加载）
   const [isCollapsed, setIsCollapsed] = useState(null);
 
-  // 创建日期到额度的映射，方便快速查找
   const checkinRecordsMap = useMemo(() => {
     const map = {};
     const records = checkinData.stats?.records || [];
     records.forEach((record) => {
-      map[record.checkin_date] = record.quota_awarded;
+      map[record.checkin_date] = record;
     });
     return map;
   }, [checkinData.stats?.records]);
 
-  // 计算本月获得的额度
   const monthlyQuota = useMemo(() => {
     const records = checkinData.stats?.records || [];
     return records.reduce(
@@ -81,7 +87,36 @@ const CheckinCalendar = ({ t, status, turnstileEnabled, turnstileSiteKey }) => {
     );
   }, [checkinData.stats?.records]);
 
-  // 获取签到状态
+  const streakInfo = useMemo(() => {
+    const streak = checkinData.current_streak || 0;
+    const milestones = [7, 15, 24, 30];
+    const bonuses = checkinData.streak_bonuses || [];
+
+    let currentBonus = 0;
+    let nextMilestone = milestones[0];
+    let nextBonus = 0;
+
+    for (const bonus of bonuses) {
+      if (streak >= bonus.min_days && (bonus.max_days <= 0 || streak <= bonus.max_days)) {
+        currentBonus = Math.max(currentBonus, bonus.bonus_rate * 100);
+      }
+    }
+
+    for (const m of milestones) {
+      if (streak < m) {
+        nextMilestone = m;
+        const nextBonusConfig = bonuses.find(b => m >= b.min_days && (b.max_days <= 0 || m <= b.max_days));
+        nextBonus = nextBonusConfig ? nextBonusConfig.bonus_rate * 100 : 0;
+        break;
+      }
+    }
+
+    const guaranteeDays = checkinData.crit_guarantee_days || 30;
+    const progress = Math.min((streak / guaranteeDays) * 100, 100);
+
+    return { streak, currentBonus, nextMilestone, nextBonus, progress, guaranteeDays };
+  }, [checkinData.current_streak, checkinData.streak_bonuses, checkinData.crit_guarantee_days]);
+
   const fetchCheckinStatus = async (month) => {
     const isFirstLoad = !initialLoaded;
     setLoading(true);
@@ -90,7 +125,6 @@ const CheckinCalendar = ({ t, status, turnstileEnabled, turnstileSiteKey }) => {
       const { success, data, message } = res.data;
       if (success) {
         setCheckinData(data);
-        // 首次加载时，根据签到状态设置折叠状态
         if (isFirstLoad) {
           setIsCollapsed(data.stats?.checked_in_today ?? false);
           setInitialLoaded(true);
@@ -132,10 +166,18 @@ const CheckinCalendar = ({ t, status, turnstileEnabled, turnstileSiteKey }) => {
       const res = await postCheckin(token);
       const { success, data, message } = res.data;
       if (success) {
-        showSuccess(
-          t('签到成功！获得') + ' ' + renderQuota(data.quota_awarded),
-        );
-        // 刷新签到状态
+        if (data.is_crit) {
+          const critMsg = data.crit_source === 'guaranteed'
+            ? t('连签30天必定暴击！')
+            : t('暴击！');
+          showSuccess(
+            `${critMsg} ${t('获得')} ${renderQuota(data.quota_awarded)} (${checkinData.crit_multiplier || 5}${t('倍奖励')})`,
+          );
+        } else {
+          showSuccess(
+            t('签到成功！获得') + ' ' + renderQuota(data.quota_awarded),
+          );
+        }
         fetchCheckinStatus(currentMonth);
         setTurnstileModalVisible(false);
       } else {
@@ -165,39 +207,45 @@ const CheckinCalendar = ({ t, status, turnstileEnabled, turnstileSiteKey }) => {
     }
   }, [status?.checkin_enabled, currentMonth]);
 
-  // 如果签到功能未启用，不显示组件
   if (!status?.checkin_enabled) {
     return null;
   }
 
-  // 日期渲染函数 - 显示签到状态和获得的额度
   const dateRender = (dateString) => {
-    // Semi Calendar 传入的 dateString 是 Date.toString() 格式
-    // 需要转换为 YYYY-MM-DD 格式来匹配后端数据
     const date = new Date(dateString);
     if (isNaN(date.getTime())) {
       return null;
     }
-    // 使用本地时间格式化，避免时区问题
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
-    const formattedDate = `${year}-${month}-${day}`; // YYYY-MM-DD
-    const quotaAwarded = checkinRecordsMap[formattedDate];
-    const isCheckedIn = quotaAwarded !== undefined;
+    const formattedDate = `${year}-${month}-${day}`;
+    const record = checkinRecordsMap[formattedDate];
+    const isCheckedIn = record !== undefined;
 
     if (isCheckedIn) {
+      const isCrit = record.is_crit;
       return (
         <Tooltip
-          content={`${t('获得')} ${renderQuota(quotaAwarded)}`}
+          content={
+            <div>
+              <div>{t('获得')} {renderQuota(record.quota_awarded)}</div>
+              {isCrit && <div className='text-amber-400'>{t('暴击')}</div>}
+              {record.streak_days > 1 && <div>{t('连签')} {record.streak_days} {t('天')}</div>}
+            </div>
+          }
           position='top'
         >
           <div className='absolute inset-0 flex flex-col items-center justify-center cursor-pointer'>
-            <div className='w-6 h-6 rounded-full bg-green-500 flex items-center justify-center mb-0.5 shadow-sm'>
-              <Check size={14} className='text-white' strokeWidth={3} />
+            <div className={`w-6 h-6 rounded-full flex items-center justify-center mb-0.5 shadow-sm ${isCrit ? 'bg-amber-500' : 'bg-green-500'}`}>
+              {isCrit ? (
+                <Zap size={14} className='text-white' strokeWidth={3} />
+              ) : (
+                <Check size={14} className='text-white' strokeWidth={3} />
+              )}
             </div>
-            <div className='text-[10px] font-medium text-green-600 dark:text-green-400 leading-none'>
-              {renderQuota(quotaAwarded)}
+            <div className={`text-[10px] font-medium leading-none ${isCrit ? 'text-amber-600 dark:text-amber-400' : 'text-green-600 dark:text-green-400'}`}>
+              {renderQuota(record.quota_awarded)}
             </div>
           </div>
         </Tooltip>
@@ -206,7 +254,6 @@ const CheckinCalendar = ({ t, status, turnstileEnabled, turnstileSiteKey }) => {
     return null;
   };
 
-  // 处理月份变化
   const handleMonthChange = (date) => {
     const month = date.toISOString().slice(0, 7);
     setCurrentMonth(month);
@@ -238,7 +285,6 @@ const CheckinCalendar = ({ t, status, turnstileEnabled, turnstileSiteKey }) => {
         </div>
       </Modal>
 
-      {/* 卡片头部 */}
       <div className='flex items-center justify-between'>
         <div
           className='flex items-center flex-1 cursor-pointer'
@@ -263,9 +309,11 @@ const CheckinCalendar = ({ t, status, turnstileEnabled, turnstileSiteKey }) => {
                 ? t('正在加载签到状态...')
                 : checkinData.stats?.checked_in_today
                   ? t('今日已签到，累计签到') +
-                    ` ${checkinData.stats?.total_checkins || 0} ` +
-                    t('天')
-                  : t('每日签到可获得随机额度奖励')}
+                  ` ${checkinData.stats?.total_checkins || 0} ` +
+                  t('天')
+                  : checkinData.dynamic_reward_enabled
+                    ? t('根据消费动态调整奖励')
+                    : t('每日签到可获得随机额度奖励')}
             </div>
           </div>
         </div>
@@ -286,10 +334,8 @@ const CheckinCalendar = ({ t, status, turnstileEnabled, turnstileSiteKey }) => {
         </Button>
       </div>
 
-      {/* 可折叠内容 */}
       <Collapsible isOpen={isCollapsed === false} keepDOM>
-        {/* 签到统计 */}
-        <div className='grid grid-cols-3 gap-3 mb-4 mt-4'>
+        <div className='grid grid-cols-4 gap-3 mb-4 mt-4'>
           <div className='text-center p-2.5 bg-slate-50 dark:bg-slate-800 rounded-lg'>
             <div className='text-xl font-bold text-green-600'>
               {checkinData.stats?.total_checkins || 0}
@@ -308,9 +354,49 @@ const CheckinCalendar = ({ t, status, turnstileEnabled, turnstileSiteKey }) => {
             </div>
             <div className='text-xs text-gray-500'>{t('累计获得')}</div>
           </div>
+          <div className='text-center p-2.5 bg-slate-50 dark:bg-slate-800 rounded-lg'>
+            <div className='flex items-center justify-center gap-1'>
+              <Flame size={16} className='text-purple-600' />
+              <span className='text-xl font-bold text-purple-600'>
+                {streakInfo.streak}
+              </span>
+            </div>
+            <div className='text-xs text-gray-500'>{t('连续签到')}</div>
+          </div>
         </div>
 
-        {/* 签到日历 - 使用更紧凑的样式 */}
+        {checkinData.dynamic_reward_enabled && (
+          <div className='mb-4 p-3 bg-gradient-to-r from-purple-50 to-amber-50 dark:from-purple-900/20 dark:to-amber-900/20 rounded-lg'>
+            <div className='flex items-center justify-between mb-2'>
+              <div className='flex items-center gap-2'>
+                <Zap size={16} className='text-amber-500' />
+                <span className='text-sm font-medium'>
+                  {t('连签进度')} ({streakInfo.streak}/{streakInfo.guaranteeDays})
+                </span>
+              </div>
+              {streakInfo.currentBonus > 0 && (
+                <span className='text-xs bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 px-2 py-0.5 rounded-full'>
+                  +{streakInfo.currentBonus}% {t('加成')}
+                </span>
+              )}
+            </div>
+            <Progress
+              percent={streakInfo.progress}
+              showInfo={false}
+              stroke='linear-gradient(to right, #8B5CF6, #F59E0B)'
+              size='small'
+            />
+            <div className='flex justify-between mt-1 text-xs text-gray-500'>
+              <span>{t('第')} {streakInfo.guaranteeDays} {t('天必定暴击')}</span>
+              {streakInfo.streak < streakInfo.nextMilestone && (
+                <span>
+                  {t('还差')} {streakInfo.nextMilestone - streakInfo.streak} {t('天达到')} +{streakInfo.nextBonus}%
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
         <Spin spinning={loading}>
           <div className='border rounded-lg overflow-hidden checkin-calendar'>
             <style>{`
@@ -366,14 +452,22 @@ const CheckinCalendar = ({ t, status, turnstileEnabled, turnstileSiteKey }) => {
           </div>
         </Spin>
 
-        {/* 签到说明 */}
         <div className='mt-3 p-2.5 bg-slate-50 dark:bg-slate-800 rounded-lg'>
           <Typography.Text type='tertiary' className='text-xs'>
-            <ul className='list-disc list-inside space-y-0.5'>
-              <li>{t('每日签到可获得随机额度奖励')}</li>
-              <li>{t('签到奖励将直接添加到您的账户余额')}</li>
-              <li>{t('每日仅可签到一次，请勿重复签到')}</li>
-            </ul>
+            {checkinData.dynamic_reward_enabled ? (
+              <ul className='list-disc list-inside space-y-0.5'>
+                <li>{t('签到奖励根据昨日消费动态调整')}</li>
+                <li>{t('连续签到可获得额外加成')}</li>
+                <li>{t('每次签到都有一定概率触发暴击（5倍奖励）')}</li>
+                <li>{t('连续签到30天必定触发暴击')}</li>
+              </ul>
+            ) : (
+              <ul className='list-disc list-inside space-y-0.5'>
+                <li>{t('每日签到可获得随机额度奖励')}</li>
+                <li>{t('签到奖励将直接添加到您的账户余额')}</li>
+                <li>{t('每日仅可签到一次，请勿重复签到')}</li>
+              </ul>
+            )}
           </Typography.Text>
         </div>
       </Collapsible>

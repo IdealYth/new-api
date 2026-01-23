@@ -12,21 +12,39 @@ import (
 
 // Checkin 签到记录
 type Checkin struct {
-	Id           int    `json:"id" gorm:"primaryKey;autoIncrement"`
-	UserId       int    `json:"user_id" gorm:"not null;uniqueIndex:idx_user_checkin_date"`
-	CheckinDate  string `json:"checkin_date" gorm:"type:varchar(10);not null;uniqueIndex:idx_user_checkin_date"` // 格式: YYYY-MM-DD
-	QuotaAwarded int    `json:"quota_awarded" gorm:"not null"`
-	CreatedAt    int64  `json:"created_at" gorm:"bigint"`
+	Id                    int    `json:"id" gorm:"primaryKey;autoIncrement"`
+	UserId                int    `json:"user_id" gorm:"not null;uniqueIndex:idx_user_checkin_date"`
+	CheckinDate           string `json:"checkin_date" gorm:"type:varchar(10);not null;uniqueIndex:idx_user_checkin_date"`
+	QuotaAwarded          int    `json:"quota_awarded" gorm:"not null"`
+	StreakDays            int    `json:"streak_days" gorm:"not null;default:1"`
+	BaseQuota             int    `json:"base_quota" gorm:"not null;default:0"`
+	IsCrit                bool   `json:"is_crit" gorm:"not null;default:false"`
+	CritSource            string `json:"crit_source" gorm:"type:varchar(16);not null;default:''"`
+	YesterdayConsumeQuota int    `json:"yesterday_consume_quota" gorm:"not null;default:0"`
+	CreatedAt             int64  `json:"created_at" gorm:"bigint"`
 }
 
-// CheckinRecord 用于API返回的签到记录（不包含敏感字段）
+// CheckinRecord 用于API返回的签到记录
 type CheckinRecord struct {
-	CheckinDate  string `json:"checkin_date"`
-	QuotaAwarded int    `json:"quota_awarded"`
+	CheckinDate           string `json:"checkin_date"`
+	QuotaAwarded          int    `json:"quota_awarded"`
+	StreakDays            int    `json:"streak_days"`
+	BaseQuota             int    `json:"base_quota"`
+	IsCrit                bool   `json:"is_crit"`
+	CritSource            string `json:"crit_source"`
+	YesterdayConsumeQuota int    `json:"yesterday_consume_quota"`
 }
 
 func (Checkin) TableName() string {
 	return "checkins"
+}
+
+func getTodayDate() string {
+	return time.Now().Format("2006-01-02")
+}
+
+func getYesterdayDate() string {
+	return time.Now().AddDate(0, 0, -1).Format("2006-01-02")
 }
 
 // GetUserCheckinRecords 获取用户在指定日期范围内的签到记录
@@ -41,7 +59,7 @@ func GetUserCheckinRecords(userId int, startDate, endDate string) ([]Checkin, er
 
 // HasCheckedInToday 检查用户今天是否已签到
 func HasCheckedInToday(userId int) (bool, error) {
-	today := time.Now().Format("2006-01-02")
+	today := getTodayDate()
 	var count int64
 	err := DB.Model(&Checkin{}).
 		Where("user_id = ? AND checkin_date = ?", userId, today).
@@ -49,16 +67,144 @@ func HasCheckedInToday(userId int) (bool, error) {
 	return count > 0, err
 }
 
+// GetUserYesterdayConsumption 获取用户昨日消费额度
+func GetUserYesterdayConsumption(userId int) (int, error) {
+	now := time.Now()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	yesterdayStart := todayStart.AddDate(0, 0, -1)
+
+	var total int64
+	err := LOG_DB.Model(&Log{}).
+		Select("COALESCE(SUM(quota), 0)").
+		Where("user_id = ? AND type = ? AND created_at >= ? AND created_at < ?",
+			userId, LogTypeConsume, yesterdayStart.Unix(), todayStart.Unix()).
+		Scan(&total).Error
+	if err != nil {
+		return 0, err
+	}
+	return int(total), nil
+}
+
+// GetUserCheckinStreak 获取用户本次签到的连签天数
+func GetUserCheckinStreak(userId int) (int, error) {
+	today := getTodayDate()
+	yesterday := getYesterdayDate()
+
+	var last Checkin
+	err := DB.Where("user_id = ?", userId).Order("checkin_date desc").Limit(1).Take(&last).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return 1, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if last.CheckinDate == today {
+		return 0, errors.New("今日已签到")
+	}
+	if last.CheckinDate == yesterday {
+		setting := operation_setting.GetCheckinSetting()
+		if setting.DynamicRewardEnabled && setting.CritGuaranteeDays > 0 && last.StreakDays >= setting.CritGuaranteeDays {
+			return 1, nil
+		}
+		if last.StreakDays > 0 {
+			return last.StreakDays + 1, nil
+		}
+		return 1, nil
+	}
+	return 1, nil
+}
+
+// GetUserCurrentStreak 获取用户当前连续签到天数
+func GetUserCurrentStreak(userId int) (int, error) {
+	today := getTodayDate()
+	yesterday := getYesterdayDate()
+
+	var last Checkin
+	err := DB.Where("user_id = ?", userId).Order("checkin_date desc").Limit(1).Take(&last).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if last.CheckinDate == today || last.CheckinDate == yesterday {
+		return last.StreakDays, nil
+	}
+	return 0, nil
+}
+
+func randomQuota(min, max int) int {
+	if max <= min {
+		return min
+	}
+	return min + rand.Intn(max-min+1)
+}
+
+func getRewardTierByConsumption(consumeRmb float64, tiers []operation_setting.CheckinRewardTier) (operation_setting.CheckinRewardTier, bool) {
+	for _, tier := range tiers {
+		if consumeRmb >= tier.MinRmb && (tier.MaxRmb < 0 || consumeRmb < tier.MaxRmb) {
+			return tier, true
+		}
+	}
+	return operation_setting.CheckinRewardTier{}, false
+}
+
+func getStreakBonusRate(streakDays int, bonuses []operation_setting.CheckinStreakBonus) float64 {
+	var bonusRate float64
+	for _, bonus := range bonuses {
+		if streakDays >= bonus.MinDays && (bonus.MaxDays <= 0 || streakDays <= bonus.MaxDays) {
+			if bonus.BonusRate > bonusRate {
+				bonusRate = bonus.BonusRate
+			}
+		}
+	}
+	return bonusRate
+}
+
+// CalculateCheckinReward 计算签到奖励
+func CalculateCheckinReward(yesterdayConsumeQuota int, streakDays int) (baseQuota int, isCrit bool, critSource string, finalQuota int) {
+	setting := operation_setting.GetCheckinSetting()
+	baseQuota = randomQuota(setting.MinQuota, setting.MaxQuota)
+
+	if setting.DynamicRewardEnabled && len(setting.RewardTiers) > 0 {
+		consumeRmb := float64(yesterdayConsumeQuota) / common.QuotaPerUnit
+		if tier, ok := getRewardTierByConsumption(consumeRmb, setting.RewardTiers); ok {
+			baseQuota = randomQuota(tier.MinQuota, tier.MaxQuota)
+		}
+	}
+
+	critAppliedQuota := baseQuota
+	if setting.CritGuaranteeDays > 0 && streakDays >= setting.CritGuaranteeDays {
+		isCrit = true
+		critSource = "guaranteed"
+	} else if setting.CritProbability > 0 && rand.Float64() < setting.CritProbability {
+		isCrit = true
+		critSource = "random"
+	}
+	if isCrit {
+		multiplier := setting.CritMultiplier
+		if multiplier < 1 {
+			multiplier = 1
+		}
+		critAppliedQuota = baseQuota * multiplier
+	}
+
+	bonusRate := getStreakBonusRate(streakDays, setting.StreakBonuses)
+	finalQuota = critAppliedQuota
+	if bonusRate > 0 {
+		finalQuota = critAppliedQuota + int(float64(critAppliedQuota)*bonusRate)
+	}
+
+	return baseQuota, isCrit, critSource, finalQuota
+}
+
 // UserCheckin 执行用户签到
-// MySQL 和 PostgreSQL 使用事务保证原子性
-// SQLite 不支持嵌套事务，使用顺序操作 + 手动回滚
 func UserCheckin(userId int) (*Checkin, error) {
 	setting := operation_setting.GetCheckinSetting()
 	if !setting.Enabled {
 		return nil, errors.New("签到功能未启用")
 	}
 
-	// 检查今天是否已签到
 	hasChecked, err := HasCheckedInToday(userId)
 	if err != nil {
 		return nil, err
@@ -67,40 +213,58 @@ func UserCheckin(userId int) (*Checkin, error) {
 		return nil, errors.New("今日已签到")
 	}
 
-	// 计算随机额度奖励
-	quotaAwarded := setting.MinQuota
-	if setting.MaxQuota > setting.MinQuota {
-		quotaAwarded = setting.MinQuota + rand.Intn(setting.MaxQuota-setting.MinQuota+1)
+	today := getTodayDate()
+	var (
+		quotaAwarded          int
+		baseQuota             int
+		isCrit                bool
+		critSource            string
+		yesterdayConsumeQuota int
+		streakDays            int
+	)
+
+	streakDays, err = GetUserCheckinStreak(userId)
+	if err != nil {
+		return nil, err
 	}
 
-	today := time.Now().Format("2006-01-02")
+	if setting.DynamicRewardEnabled {
+		yesterdayConsumeQuota, err = GetUserYesterdayConsumption(userId)
+		if err != nil {
+			return nil, err
+		}
+		baseQuota, isCrit, critSource, quotaAwarded = CalculateCheckinReward(yesterdayConsumeQuota, streakDays)
+	} else {
+		quotaAwarded = randomQuota(setting.MinQuota, setting.MaxQuota)
+		baseQuota = quotaAwarded
+	}
+
 	checkin := &Checkin{
-		UserId:       userId,
-		CheckinDate:  today,
-		QuotaAwarded: quotaAwarded,
-		CreatedAt:    time.Now().Unix(),
+		UserId:                userId,
+		CheckinDate:           today,
+		QuotaAwarded:          quotaAwarded,
+		StreakDays:            streakDays,
+		BaseQuota:             baseQuota,
+		IsCrit:                isCrit,
+		CritSource:            critSource,
+		YesterdayConsumeQuota: yesterdayConsumeQuota,
+		CreatedAt:             time.Now().Unix(),
 	}
 
-	// 根据数据库类型选择不同的策略
 	if common.UsingSQLite {
-		// SQLite 不支持嵌套事务，使用顺序操作 + 手动回滚
 		return userCheckinWithoutTransaction(checkin, userId, quotaAwarded)
 	}
 
-	// MySQL 和 PostgreSQL 支持事务，使用事务保证原子性
 	return userCheckinWithTransaction(checkin, userId, quotaAwarded)
 }
 
 // userCheckinWithTransaction 使用事务执行签到（适用于 MySQL 和 PostgreSQL）
 func userCheckinWithTransaction(checkin *Checkin, userId int, quotaAwarded int) (*Checkin, error) {
 	err := DB.Transaction(func(tx *gorm.DB) error {
-		// 步骤1: 创建签到记录
-		// 数据库有唯一约束 (user_id, checkin_date)，可以防止并发重复签到
 		if err := tx.Create(checkin).Error; err != nil {
 			return errors.New("签到失败，请稍后重试")
 		}
 
-		// 步骤2: 在事务中增加用户额度
 		if err := tx.Model(&User{}).Where("id = ?", userId).
 			Update("quota", gorm.Expr("quota + ?", quotaAwarded)).Error; err != nil {
 			return errors.New("签到失败：更新额度出错")
@@ -113,7 +277,6 @@ func userCheckinWithTransaction(checkin *Checkin, userId int, quotaAwarded int) 
 		return nil, err
 	}
 
-	// 事务成功后，异步更新缓存
 	go func() {
 		_ = cacheIncrUserQuota(userId, int64(quotaAwarded))
 	}()
@@ -123,16 +286,11 @@ func userCheckinWithTransaction(checkin *Checkin, userId int, quotaAwarded int) 
 
 // userCheckinWithoutTransaction 不使用事务执行签到（适用于 SQLite）
 func userCheckinWithoutTransaction(checkin *Checkin, userId int, quotaAwarded int) (*Checkin, error) {
-	// 步骤1: 创建签到记录
-	// 数据库有唯一约束 (user_id, checkin_date)，可以防止并发重复签到
 	if err := DB.Create(checkin).Error; err != nil {
 		return nil, errors.New("签到失败，请稍后重试")
 	}
 
-	// 步骤2: 增加用户额度
-	// 使用 db=true 强制直接写入数据库，不使用批量更新
 	if err := IncreaseUserQuota(userId, quotaAwarded, true); err != nil {
-		// 如果增加额度失败，需要回滚签到记录
 		DB.Delete(checkin)
 		return nil, errors.New("签到失败：更新额度出错")
 	}
@@ -142,7 +300,6 @@ func userCheckinWithoutTransaction(checkin *Checkin, userId int, quotaAwarded in
 
 // GetUserCheckinStats 获取用户签到统计信息
 func GetUserCheckinStats(userId int, month string) (map[string]interface{}, error) {
-	// 获取指定月份的所有签到记录
 	startDate := month + "-01"
 	endDate := month + "-31"
 
@@ -151,29 +308,31 @@ func GetUserCheckinStats(userId int, month string) (map[string]interface{}, erro
 		return nil, err
 	}
 
-	// 转换为不包含敏感字段的记录
 	checkinRecords := make([]CheckinRecord, len(records))
 	for i, r := range records {
 		checkinRecords[i] = CheckinRecord{
-			CheckinDate:  r.CheckinDate,
-			QuotaAwarded: r.QuotaAwarded,
+			CheckinDate:           r.CheckinDate,
+			QuotaAwarded:          r.QuotaAwarded,
+			StreakDays:            r.StreakDays,
+			BaseQuota:             r.BaseQuota,
+			IsCrit:                r.IsCrit,
+			CritSource:            r.CritSource,
+			YesterdayConsumeQuota: r.YesterdayConsumeQuota,
 		}
 	}
 
-	// 检查今天是否已签到
 	hasCheckedToday, _ := HasCheckedInToday(userId)
 
-	// 获取用户所有时间的签到统计
 	var totalCheckins int64
 	var totalQuota int64
 	DB.Model(&Checkin{}).Where("user_id = ?", userId).Count(&totalCheckins)
 	DB.Model(&Checkin{}).Where("user_id = ?", userId).Select("COALESCE(SUM(quota_awarded), 0)").Scan(&totalQuota)
 
 	return map[string]interface{}{
-		"total_quota":      totalQuota,      // 所有时间累计获得的额度
-		"total_checkins":   totalCheckins,   // 所有时间累计签到次数
-		"checkin_count":    len(records),    // 本月签到次数
-		"checked_in_today": hasCheckedToday, // 今天是否已签到
-		"records":          checkinRecords,  // 本月签到记录详情（不含id和user_id）
+		"total_quota":      totalQuota,
+		"total_checkins":   totalCheckins,
+		"checkin_count":    len(records),
+		"checked_in_today": hasCheckedToday,
+		"records":          checkinRecords,
 	}, nil
 }
