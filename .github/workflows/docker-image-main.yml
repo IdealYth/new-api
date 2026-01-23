@@ -1,18 +1,23 @@
-name: Publish Docker image (main)
+name: Publish Docker image
 
 on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       name:
         description: "reason"
         required: false
 
+env:
+  DOCKERHUB_REPO: idealyouth/new-api
+
 jobs:
   build_single_arch:
-    name: Build & push (${{ matrix.arch }}) [native]
+    name: Build (${{ matrix.arch }}) [native]
     strategy:
       fail-fast: false
       matrix:
@@ -27,20 +32,14 @@ jobs:
     permissions:
       packages: write
       contents: read
+    outputs:
+      digest-amd64: ${{ steps.build.outputs.digest-amd64 }}
+      digest-arm64: ${{ steps.build.outputs.digest-arm64 }}
     steps:
-      - name: Check out (shallow)
+      - name: Check out
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-
-      - name: Determine version
-        id: version
-        run: |
-          VERSION="$(date +'%Y%m%d')-$(git rev-parse --short HEAD)"
-          echo "$VERSION" > VERSION
-          echo "value=$VERSION" >> $GITHUB_OUTPUT
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "Publishing version: $VERSION for ${{ matrix.arch }}"
 
       - name: Normalize GHCR repository
         run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
@@ -66,68 +65,103 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            idealyouth/new-api
+            ${{ env.DOCKERHUB_REPO }}
             ghcr.io/${{ env.GHCR_REPOSITORY }}
 
-      - name: Build & push single-arch (to both registries)
+      - name: Build & push by digest (Docker Hub)
+        id: build-dockerhub
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          push: true
-          tags: |
-            idealyouth/new-api:latest-${{ matrix.arch }}
-            idealyouth/new-api:${{ steps.version.outputs.value }}-${{ matrix.arch }}
-            ghcr.io/${{ env.GHCR_REPOSITORY }}:latest-${{ matrix.arch }}
-            ghcr.io/${{ env.GHCR_REPOSITORY }}:${{ steps.version.outputs.value }}-${{ matrix.arch }}
+          outputs: type=image,name=${{ env.DOCKERHUB_REPO }},push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
           provenance: false
           sbom: false
 
+      - name: Build & push by digest (GHCR)
+        id: build-ghcr
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/${{ env.GHCR_REPOSITORY }},push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.arch }}-ghcr
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}-ghcr
+          provenance: false
+          sbom: false
+
+      - name: Export digest
+        id: build
+        run: |
+          echo "digest-${{ matrix.arch }}=${{ steps.build-dockerhub.outputs.digest }}" >> $GITHUB_OUTPUT
+          echo "digest-${{ matrix.arch }}-ghcr=${{ steps.build-ghcr.outputs.digest }}" >> $GITHUB_OUTPUT
+
+      - name: Save digests to file
+        run: |
+          mkdir -p /tmp/digests
+          echo "${{ steps.build-dockerhub.outputs.digest }}" > /tmp/digests/dockerhub-${{ matrix.arch }}
+          echo "${{ steps.build-ghcr.outputs.digest }}" > /tmp/digests/ghcr-${{ matrix.arch }}
+
+      - name: Upload digests
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
   create_manifests:
-    name: Create multi-arch manifests (Docker Hub + GHCR)
+    name: Create multi-arch manifests
     needs: [build_single_arch]
     runs-on: ubuntu-latest
     permissions:
       packages: write
       contents: read
     steps:
-      - name: Check out (shallow)
+      - name: Check out
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Normalize GHCR repository
-        run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
-
       - name: Determine version
         id: version
         run: |
-          VERSION="$(date +'%Y%m%d')-$(git rev-parse --short HEAD)"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            echo "is_tag=true" >> $GITHUB_OUTPUT
+          else
+            VERSION=""
+            echo "is_tag=false" >> $GITHUB_OUTPUT
+          fi
           echo "value=$VERSION" >> $GITHUB_OUTPUT
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Version: $VERSION"
+
+      - name: Normalize GHCR repository
+        run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Read digests
+        id: digests
+        run: |
+          echo "dockerhub-amd64=$(cat /tmp/digests/dockerhub-amd64)" >> $GITHUB_OUTPUT
+          echo "dockerhub-arm64=$(cat /tmp/digests/dockerhub-arm64)" >> $GITHUB_OUTPUT
+          echo "ghcr-amd64=$(cat /tmp/digests/ghcr-amd64)" >> $GITHUB_OUTPUT
+          echo "ghcr-arm64=$(cat /tmp/digests/ghcr-arm64)" >> $GITHUB_OUTPUT
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Create & push manifest (Docker Hub - latest)
-        run: |
-          docker buildx imagetools create \
-            -t idealyouth/new-api:latest \
-            idealyouth/new-api:latest-amd64 \
-            idealyouth/new-api:latest-arm64
-
-      - name: Create & push manifest (Docker Hub - versioned)
-        run: |
-          docker buildx imagetools create \
-            -t idealyouth/new-api:${VERSION} \
-            idealyouth/new-api:${VERSION}-amd64 \
-            idealyouth/new-api:${VERSION}-arm64
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -136,16 +170,32 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create & push manifest (GHCR - latest)
+      - name: Create manifest (Docker Hub - latest)
         run: |
           docker buildx imagetools create \
-            -t ghcr.io/${GHCR_REPOSITORY}:latest \
-            ghcr.io/${GHCR_REPOSITORY}:latest-amd64 \
-            ghcr.io/${GHCR_REPOSITORY}:latest-arm64
+            -t ${{ env.DOCKERHUB_REPO }}:latest \
+            ${{ env.DOCKERHUB_REPO }}@${{ steps.digests.outputs.dockerhub-amd64 }} \
+            ${{ env.DOCKERHUB_REPO }}@${{ steps.digests.outputs.dockerhub-arm64 }}
 
-      - name: Create & push manifest (GHCR - versioned)
+      - name: Create manifest (Docker Hub - versioned)
+        if: steps.version.outputs.is_tag == 'true'
         run: |
           docker buildx imagetools create \
-            -t ghcr.io/${GHCR_REPOSITORY}:${VERSION} \
-            ghcr.io/${GHCR_REPOSITORY}:${VERSION}-amd64 \
-            ghcr.io/${GHCR_REPOSITORY}:${VERSION}-arm64
+            -t ${{ env.DOCKERHUB_REPO }}:${{ steps.version.outputs.value }} \
+            ${{ env.DOCKERHUB_REPO }}@${{ steps.digests.outputs.dockerhub-amd64 }} \
+            ${{ env.DOCKERHUB_REPO }}@${{ steps.digests.outputs.dockerhub-arm64 }}
+
+      - name: Create manifest (GHCR - latest)
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ env.GHCR_REPOSITORY }}:latest \
+            ghcr.io/${{ env.GHCR_REPOSITORY }}@${{ steps.digests.outputs.ghcr-amd64 }} \
+            ghcr.io/${{ env.GHCR_REPOSITORY }}@${{ steps.digests.outputs.ghcr-arm64 }}
+
+      - name: Create manifest (GHCR - versioned)
+        if: steps.version.outputs.is_tag == 'true'
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ env.GHCR_REPOSITORY }}:${{ steps.version.outputs.value }} \
+            ghcr.io/${{ env.GHCR_REPOSITORY }}@${{ steps.digests.outputs.ghcr-amd64 }} \
+            ghcr.io/${{ env.GHCR_REPOSITORY }}@${{ steps.digests.outputs.ghcr-arm64 }}
