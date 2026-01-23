@@ -47,7 +47,24 @@
 
 </div>
 
-## 📝 项目说明
+## ⚠️ 关于本仓库
+
+> [!CAUTION]
+> **本仓库为个人自用版本，不提供任何技术支持！**
+
+**Docker Hub 镜像：** `idealyouth/new-api:latest`
+
+```bash
+docker pull idealyouth/new-api:latest
+```
+
+### � 更新日志
+
+- **2025-01-23** - 新增动态签到奖励系统（支持消费动态奖励、连签加成、暴击机制）
+
+---
+
+## �📝 项目说明
 
 > [!NOTE]  
 > 本项目为开源项目，在 [One API](https://github.com/songquanpeng/one-api) 的基础上进行二次开发
