@@ -20,6 +20,7 @@ func GetCheckinStatus(c *gin.Context) {
 		return
 	}
 	userId := c.GetInt("id")
+	// 获取月份参数，默认为当前月份
 	month := c.DefaultQuery("month", time.Now().Format("2006-01"))
 
 	stats, err := model.GetUserCheckinStats(userId, month)
@@ -31,22 +32,13 @@ func GetCheckinStatus(c *gin.Context) {
 		return
 	}
 
-	currentStreak, _ := model.GetUserCurrentStreak(userId)
-
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data": gin.H{
-			"enabled":                setting.Enabled,
-			"min_quota":              setting.MinQuota,
-			"max_quota":              setting.MaxQuota,
-			"dynamic_reward_enabled": setting.DynamicRewardEnabled,
-			"reward_tiers":           setting.RewardTiers,
-			"streak_bonuses":         setting.StreakBonuses,
-			"crit_probability":       setting.CritProbability,
-			"crit_multiplier":        setting.CritMultiplier,
-			"crit_guarantee_days":    setting.CritGuaranteeDays,
-			"current_streak":         currentStreak,
-			"stats":                  stats,
+			"enabled":   setting.Enabled,
+			"min_quota": setting.MinQuota,
+			"max_quota": setting.MaxQuota,
+			"stats":     stats,
 		},
 	})
 }
@@ -74,13 +66,7 @@ func DoCheckin(c *gin.Context) {
 		"success": true,
 		"message": "签到成功",
 		"data": gin.H{
-			"quota_awarded":           checkin.QuotaAwarded,
-			"checkin_date":            checkin.CheckinDate,
-			"streak_days":             checkin.StreakDays,
-			"base_quota":              checkin.BaseQuota,
-			"is_crit":                 checkin.IsCrit,
-			"crit_source":             checkin.CritSource,
-			"yesterday_consume_quota": checkin.YesterdayConsumeQuota,
-		},
+			"quota_awarded": checkin.QuotaAwarded,
+			"checkin_date":  checkin.CheckinDate},
 	})
 }
